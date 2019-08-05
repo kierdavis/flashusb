@@ -6,6 +6,7 @@ flashusb - flash USB sticks with a template filesystem, in parallel
 * A Linux-based operating system
 * [Python](https://www.python.org/) (>= 3.6)
 * [parted](https://www.gnu.org/software/parted/)
+* [dosfstools](https://github.com/dosfstools/dosfstools)
 * [rsync](https://rsync.samba.org/)
 
 Nix/NixOS users can start a shell in which these dependencies are available by running `nix-shell` in a checkout of this repository.
