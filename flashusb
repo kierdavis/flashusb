@@ -1,0 +1,195 @@
+#!/usr/bin/env python
+
+import argparse
+import asyncio
+import logging
+import pathlib
+import tempfile
+import stat
+import string
+import shlex
+from io import SEEK_END
+from contextlib import asynccontextmanager
+
+global_logger = logging.getLogger("flashusb")
+
+def is_block_device(path):
+  return stat.S_ISBLK(path.stat().st_mode)
+
+def ends_with_digit(s):
+  return s.endswith(tuple(string.digits))
+
+class OperationFailedError(RuntimeError):
+  pass
+
+class Device:
+  def __init__(self, path):
+    self.path = pathlib.Path(path)
+    self.logger = logging.getLogger(f"flashusb({self.path})")
+
+  @property
+  def partition_path(self):
+    # /dev/sdb -> /dev/sdb1
+    return self.path.with_name(self.path.name + "1")
+
+  @property
+  def size(self):
+    with self.path.open("rb") as file:
+      return file.seek(0, SEEK_END)
+
+  def check(self):
+    # Check if path points to a block device.
+    if not is_block_device(self.path):
+      self.logger.error("not a block device")
+      return False
+    # Check if path looks like a partition rather than a whole disk.
+    if ends_with_digit(self.path.name):
+      self.logger.warning("looks like it might be a partition, not a whole disk")
+    return True
+
+  async def flash(self, args):
+    try:
+      await self._flash(args)
+      return True
+    except OperationFailedError as e:
+      self.logger.error(f"operation failed: {e}")
+      return False
+    except BaseException as e:
+      self.logger.exception("unhandled exception")
+      return False
+
+  async def _flash(self, args):
+    await self._reset_partition_table()
+    await self._create_partition()
+    await self._refresh_kernel_partition_info()
+    if not self.partition_path.exists() or not is_block_device(self.partition_path):
+      self.logger.error(f"partition block device {self.partition_path} was not created as expected, aborting")
+      return
+    await self._create_filesystem(args.volume_label)
+    if args.template_path is not None:
+      async with self._mounted() as mountpoint_path:
+        await self._copy_contents(args.template_path, mountpoint_path)
+
+  async def _reset_partition_table(self):
+    self.logger.info("resetting partition table")
+    await self._exec_parted("mklabel", "msdos")
+
+  async def _create_partition(self):
+    self.logger.info("creating partition")
+    await self._exec_parted("mkpart", "primary", "fat32", "0%", "100%")
+
+  async def _refresh_kernel_partition_info(self):
+    self.logger.info("refreshing kernel's partition tables")
+    await self._exec("partprobe", self.path)
+
+  async def _create_filesystem(self, volume_label):
+    self.logger.info("creating filesystem")
+    await self._exec("mkfs.fat", "-n", volume_label, self.partition_path)
+
+  async def _copy_contents(self, source_dir, dest_dir):
+    self.logger.info(f"copying data from {source_dir} to {dest_dir}")
+    await self._exec("rsync", "--recursive", "--links", "--perms", f"{source_dir}/", f"{dest_dir}/")
+
+  @asynccontextmanager
+  async def _mounted(self):
+    with tempfile.TemporaryDirectory(suffix=".flashusb-mount") as mountpoint_path:
+      mountpoint_path = pathlib.Path(mountpoint_path)
+      await self._mount(mountpoint_path)
+      try:
+        yield mountpoint_path
+      finally:
+        await self._unmount()
+
+  async def _mount(self, mountpoint_path):
+    self.logger.info(f"mounting filesystem at {mountpoint_path}")
+    await self._exec("mount", self.partition_path, mountpoint_path)
+
+  async def _unmount(self):
+    self.logger.info("unmounting filesystem")
+    await self._exec("umount", self.partition_path)
+
+  async def _exec_parted(self, *parted_command):
+    await self._exec("parted", "--script", self.path, *parted_command)
+
+  async def _exec(self, *command, ):
+    command = [str(component) for component in command]
+    command_str = " ".join(shlex.quote(component) for component in command)
+    self.logger.debug(f"executing: {command_str}")
+    process = await asyncio.create_subprocess_exec(*command)
+    exit_code = await process.wait()
+    if exit_code != 0:
+      raise OperationFailedError(f"child process {command_str!r} exited with non-zero status {exit_code}")
+
+def abort():
+  global_logger.info("aborting")
+  raise SystemExit(1)
+
+def check_all_devices(devices):
+  if not all(device.check() for device in devices):
+    abort()
+
+def ask_to_proceed(devices):
+  print("The following devices will be flashed:")
+  for device in devices:
+    print(f"  {device.path} ({device.size/(1024*1024*1024):.1f} GiB)")
+  while True:
+    response = input("Proceed? (y/n) ").lower()
+    if response.startswith("y"):
+      break
+    elif response.startswith("n"):
+      abort()
+
+async def flash_all_devices_async(devices, args):
+  coros = [device.flash(args) for device in devices]
+  success_flags = await asyncio.gather(*coros)
+  return all(success_flags)
+
+def flash_all_devices(devices, args):
+  success = asyncio.run(flash_all_devices_async(devices, args))
+  if not success:
+    abort()
+
+def main():
+  parser = argparse.ArgumentParser()
+  parser.add_argument(
+    "device_paths",
+    metavar="DEVICE_PATH",
+    type=pathlib.Path,
+    nargs="+",
+    help="a path to a device (NOT a partition) in /dev representing a USB stick to flash e.g. /dev/sdb",
+  )
+  parser.add_argument(
+    "-L", "--label",
+    dest="volume_label",
+    default="ROBOT",
+    help="volume label",
+  )
+  parser.add_argument(
+    "-t", "--template",
+    dest="template_path",
+    type=pathlib.Path,
+    default=None,
+    help="directory whose contents will be copied to the root of every flashed USB stick",
+  )
+  parser.add_argument(
+    "-v", "--verbose",
+    action="store_true",
+    default=False,
+    help="enable debug log messages",
+  )
+  args = parser.parse_args()
+
+  logging.basicConfig(
+    level=(logging.DEBUG if args.verbose else logging.INFO),
+    format="%(levelname)-8s %(name)s - %(message)s",
+  )
+
+  devices = [Device(path) for path in args.device_paths]
+  check_all_devices(devices)
+  ask_to_proceed(devices)
+  flash_all_devices(devices, args)
+
+  global_logger.info("operation succeeded")
+
+if __name__ == "__main__":
+  main()
