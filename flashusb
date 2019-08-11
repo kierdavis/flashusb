@@ -19,6 +19,17 @@ def is_block_device(path):
 def ends_with_digit(s):
   return s.endswith(tuple(string.digits))
 
+async def exec_command(*command, logger=None):
+  if logger is None:
+    logger = global_logger
+  command = [str(component) for component in command]
+  command_str = " ".join(shlex.quote(component) for component in command)
+  logger.debug(f"executing: {command_str}")
+  process = await asyncio.create_subprocess_exec(*command)
+  exit_code = await process.wait()
+  if exit_code != 0:
+    raise OperationFailedError(f"child process {command_str!r} exited with non-zero status {exit_code}")
+
 class OperationFailedError(RuntimeError):
   pass
 
@@ -111,14 +122,8 @@ class Device:
   async def _exec_parted(self, *parted_command):
     await self._exec("parted", "--script", self.path, *parted_command)
 
-  async def _exec(self, *command, ):
-    command = [str(component) for component in command]
-    command_str = " ".join(shlex.quote(component) for component in command)
-    self.logger.debug(f"executing: {command_str}")
-    process = await asyncio.create_subprocess_exec(*command)
-    exit_code = await process.wait()
-    if exit_code != 0:
-      raise OperationFailedError(f"child process {command_str!r} exited with non-zero status {exit_code}")
+  async def _exec(self, *command):
+    await exec_command(*command, logger=self.logger)
 
 def abort():
   global_logger.info("aborting")
