@@ -144,9 +144,14 @@ def ask_to_proceed(devices):
     elif response.startswith("n"):
       abort()
 
+async def flush_everything_to_disk():
+  global_logger.info("flushing everything to disk")
+  await exec_command("sync")
+
 async def flash_all_devices_async(devices, args):
   coros = [device.flash(args) for device in devices]
   success_flags = await asyncio.gather(*coros)
+  await flush_everything_to_disk()
   return all(success_flags)
 
 def flash_all_devices(devices, args):
